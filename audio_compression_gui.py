@@ -1,13 +1,17 @@
 import sys
 import os
 import numpy as np
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
+                              QPushButton, QFileDialog, QLabel, QComboBox, QSizePolicy)
 from pydub import AudioSegment
 from pydub.playback import play
 from scipy.signal import butter, filtfilt
 from scipy.fftpack import dct, idct
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.pyplot as plt
 from huffman import HuffmanCoder
+from LZW import LZWCoder
+from psychoacousticmodel import PsychoacousticModel
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -61,29 +65,139 @@ def quantifier(coeffs, q=0.02):
 def dequantifier(qcoeffs, q=0.02):
     return qcoeffs.astype(np.float32) * q
 
-def sauvegarder_compression(filename, qcoeffs, fs, frame_size):
-    huffman = HuffmanCoder(precision=0)
-    flat_qcoeffs = qcoeffs.flatten().tolist()
-    compressed_data = huffman.compress(flat_qcoeffs)
+def compress_audio():
+    global audio, file_path, layout
+    if not audio:
+        file_label.setText("Aucun fichier audio chargé")
+        return
     
-    with open(filename, 'wb') as f:
+    compression_type = compression_combo.currentText()
+    
+    # Load and preprocess audio
+    audio.export(original_file, format="wav")
+    fs = audio.frame_rate
+    signal = audio_to_signal(audio)
+    signal = centrer_signal(signal)
+    signal = normaliser_signal(signal)
+    
+    frame_size = 1024
+    coeffs = mdct(signal, frame_size=frame_size)
+    
+    # Initialize PsychoacousticModel if masking is involved
+
+    q = 0.02
+    qcoeffs = quantifier(coeffs, q=q)
+    
+    # Compression based on selected type
+    if compression_type == "LZW only":
+        lzw = LZWCoder()
+        compressed_data = lzw.compress(qcoeffs.flatten().tobytes())
+    elif compression_type == "Huffman only":
+        huffman = HuffmanCoder(precision=0)
+        flat_qcoeffs = qcoeffs.flatten().tolist()
+        compressed_data = huffman.compress(flat_qcoeffs)
+    elif compression_type == "Huffman + LZW":
+        huffman = HuffmanCoder(precision=0)
+        flat_qcoeffs = qcoeffs.flatten().tolist()
+        huffman_compressed = huffman.compress(flat_qcoeffs)
+        lzw = LZWCoder()
+        compressed_data = lzw.compress(huffman_compressed)
+    elif compression_type == "Huffman + LZW + Masquage":
+        psycho_model = PsychoacousticModel(fs)
+        weights = psycho_model.perceptual_bit_allocation(coeffs, frame_size)
+        coeffs = coeffs * weights   
+        qcoeffs =  quantifier(coeffs, q=q)
+        huffman = HuffmanCoder(precision=0)
+        flat_qcoeffs = qcoeffs.flatten().tolist()
+        huffman_compressed = huffman.compress(flat_qcoeffs)
+        lzw = LZWCoder()
+        compressed_data = lzw.compress(huffman_compressed)
+    elif compression_type == "Huffman + Masquage":
+        psycho_model = PsychoacousticModel(fs)
+        weights = psycho_model.perceptual_bit_allocation(coeffs, frame_size)
+        coeffs = coeffs * weights
+        qcoeffs =  quantifier(coeffs, q=q)
+        huffman = HuffmanCoder(precision=0)
+        flat_qcoeffs = qcoeffs.flatten().tolist()
+        compressed_data = huffman.compress(flat_qcoeffs)
+    elif compression_type == "LZW + Masquage":
+        psycho_model = PsychoacousticModel(fs)
+        weights = psycho_model.perceptual_bit_allocation(coeffs, frame_size)
+        coeffs = coeffs * weights
+        qcoeffs =  quantifier(coeffs, q=q)
+        lzw = LZWCoder()
+        compressed_data = lzw.compress(qcoeffs.flatten().tobytes())
+    
+    # Save compressed data
+    with open(compressed_file, 'wb') as f:
         header = np.array([fs, frame_size, qcoeffs.shape[0], qcoeffs.shape[1]], dtype=np.int32)
         header.tofile(f)
         f.write(compressed_data)
     
-    return compressed_data
-
-def charger_compression(filename):
-    with open(filename, 'rb') as f:
+    # Decompression
+    with open(compressed_file, 'rb') as f:
         header = np.fromfile(f, dtype=np.int32, count=4)
-        fs, frame_size, rows, cols = header
+        fs_loaded, frame_size_loaded, rows, cols = header
         compressed_data = f.read()
     
-    huffman = HuffmanCoder(precision=0)
-    flat_qcoeffs = huffman.decompress(compressed_data)
-    qcoeffs = np.array(flat_qcoeffs, dtype=np.int16).reshape(rows, cols)
+    if compression_type == "LZW only":
+        lzw = LZWCoder()
+        decompressed_data = lzw.decompress(compressed_data)
+        qcoeffs_loaded = np.frombuffer(decompressed_data, dtype=np.int16).reshape(rows, cols)
+    elif compression_type == "Huffman only":
+        huffman = HuffmanCoder(precision=0)
+        flat_qcoeffs = huffman.decompress(compressed_data)
+        qcoeffs_loaded = np.array(flat_qcoeffs, dtype=np.int16).reshape(rows, cols)
+    elif compression_type == "Huffman + LZW":
+        lzw = LZWCoder()
+        huffman_data = lzw.decompress(compressed_data)
+        huffman = HuffmanCoder(precision=0)
+        flat_qcoeffs = huffman.decompress(huffman_data)
+        qcoeffs_loaded = np.array(flat_qcoeffs, dtype=np.int16).reshape(rows, cols)
+    elif compression_type == "Huffman + LZW + Masquage":
+        lzw = LZWCoder()
+        huffman_data = lzw.decompress(compressed_data)
+        huffman = HuffmanCoder(precision=0)
+        flat_qcoeffs = huffman.decompress(huffman_data)
+        qcoeffs_loaded = np.array(flat_qcoeffs, dtype=np.int16).reshape(rows, cols)
+    elif compression_type == "Huffman + Masquage":
+        huffman = HuffmanCoder(precision=0)
+        flat_qcoeffs = huffman.decompress(compressed_data)
+        qcoeffs_loaded = np.array(flat_qcoeffs, dtype=np.int16).reshape(rows, cols)
+    elif compression_type == "LZW + Masquage":
+        lzw = LZWCoder()
+        decompressed_data = lzw.decompress(compressed_data)
+        qcoeffs_loaded = np.frombuffer(decompressed_data, dtype=np.int16).reshape(rows, cols)
     
-    return qcoeffs, fs, frame_size
+    # Reconstruct signal
+    coeffs_recon = dequantifier(qcoeffs_loaded, q=q)
+    signal_recon = imdct(coeffs_recon, frame_size=frame_size_loaded)
+    signal_recon = normaliser_signal(signal_recon)
+    
+    # Save reconstructed audio
+    audio_recon = signal_to_audio(signal_recon, fs)
+    audio_recon.export(reconstructed_file, format="wav")
+    
+    file_label.setText(f"Fichier compressé avec {compression_type}\nFichier Compressé: output.irm")
+    
+    # Clear previous plot
+    for i in reversed(range(main_layout.count())):
+        widget = main_layout.itemAt(i).widget()
+        if isinstance(widget, FigureCanvas):
+            main_layout.removeWidget(widget)
+            widget.deleteLater()
+    
+    # Plot original vs reconstructed signal
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(signal[:1000], label="Original")
+    ax.plot(signal_recon[:1000], label="Reconstruit", alpha=0.7)
+    ax.legend()
+    ax.set_title("Comparaison Original vs Reconstruit")
+    ax.grid(True)
+    
+    canvas = FigureCanvas(fig)
+    canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    main_layout.addWidget(canvas, stretch=1)
 
 def signal_to_audio(signal, fs):
     signal = np.clip(signal, -1, 1)
@@ -97,38 +211,9 @@ def load_file():
     
     if file_path:
         audio = AudioSegment.from_file(file_path)
-        file_label.setText(f"Loaded: {file_path}")
+        file_label.setText(f"Loaded: {os.path.basename(file_path)}")
     else:
         file_label.setText("Aucun fichier sélectionné")
-
-def compress_audio():
-    global audio, file_path
-    if not audio:
-        file_label.setText("Aucun fichier audio chargé")
-        return
-    
-    audio.export(original_file, format="wav")
-    fs = audio.frame_rate
-    signal = audio_to_signal(audio)
-    signal = centrer_signal(signal)
-    signal = normaliser_signal(signal)
-
-    frame_size = 1024
-    coeffs = mdct(signal, frame_size=frame_size)
-    q = 0.02
-    qcoeffs = quantifier(coeffs, q=q)
-    
-    sauvegarder_compression(compressed_file, qcoeffs, fs, frame_size)
-    
-    qcoeffs_loaded, fs_loaded, frame_size_loaded = charger_compression(compressed_file)
-    coeffs_recon = dequantifier(qcoeffs_loaded, q=q)
-    signal_recon = imdct(coeffs_recon, frame_size=frame_size_loaded)
-    signal_recon = normaliser_signal(signal_recon)
-    
-    audio_recon = signal_to_audio(signal_recon, fs)
-    audio_recon.export(reconstructed_file, format="wav")
-    
-    file_label.setText(f"Fichier compressé: {compressed_file}")
 
 def play_compressed_audio():
     if os.path.exists(reconstructed_file):
@@ -142,7 +227,7 @@ def show_size_difference():
         original_size = os.path.getsize(original_file) / 1024
         compressed_size = os.path.getsize(compressed_file) / 1024
         diff = original_size - compressed_size
-        file_label.setText(f"Différence de taille: {diff:.2f} Ko\nOriginal: {original_size:.2f} Ko\nCompressé: {compressed_size:.2f} Ko")
+        file_label.setText(f"Différence: {diff:.2f} Ko\nOriginal: {original_size:.2f} Ko\nCompressé: {compressed_size:.2f} Ko")
     else:
         file_label.setText("Fichiers nécessaires non disponibles")
 
@@ -152,7 +237,7 @@ def show_compression_percentage():
         compressed_size = os.path.getsize(compressed_file) / 1024
         if original_size > 0:
             percentage = (1 - compressed_size / original_size) * 100
-            file_label.setText(f"Pourcentage de compression: {percentage:.2f}%")
+            file_label.setText(f"Compression: {percentage:.2f}%")
         else:
             file_label.setText("Taille originale invalide")
     else:
@@ -162,7 +247,7 @@ app = QApplication(sys.argv) if not QApplication.instance() else QApplication.in
 
 window = QWidget()
 window.setWindowTitle("Project TNIM - Audio Compression")
-window.setGeometry(100, 100, 1000, 500)
+window.setGeometry(100, 100, 1000, 700)
 window.setStyleSheet("""
     QWidget {
         background-color: #2E2E2E;
@@ -178,44 +263,79 @@ window.setStyleSheet("""
     QPushButton {
         background-color: transparent;
         color: #8EBCFF;
-        border-radius: 18px;
-        padding: 20px;
-        font-size: 14px;
-        width: 60%;
-        margin-top: 30px;
+        border-radius: 12px;
+        padding: 8px;
+        font-size: 12px;
+        min-width: 120px;
+        margin: 5px;
     }
     QPushButton:hover {
         background-color: #8EBCFF;
         color: white;
     }
+    QComboBox {
+        background-color: #3E3E3E;
+        color: #FFFFFF;
+        padding: 8px;
+        border-radius: 5px;
+        min-width: 200px;
+        margin: 5px;
+    }
+    QComboBox::drop-down {
+        border: none;
+    }
 """)
 
-layout = QVBoxLayout()
+# Main layout with plot at top and controls below
+main_layout = QVBoxLayout()
+window.setLayout(main_layout)
 
+# File label
 file_label = QLabel("Aucun fichier sélectionné")
-layout.addWidget(file_label)
+main_layout.addWidget(file_label)
 
-load_button = QPushButton("Sélectionner le fichier audio")
+# First row of buttons
+button_row1 = QHBoxLayout()
+load_button = QPushButton("Sélectionner")
 load_button.clicked.connect(load_file)
-layout.addWidget(load_button)
+button_row1.addWidget(load_button)
 
-compress_button = QPushButton("Compresser le fichier audio")
+compression_combo = QComboBox()
+compression_combo.addItems([
+    "LZW only",
+    "Huffman only",
+    "Huffman + LZW",
+    "Huffman + LZW + Masquage",
+    "Huffman + Masquage",
+    "LZW + Masquage"
+])
+button_row1.addWidget(compression_combo)
+
+compress_button = QPushButton("Compresser")
 compress_button.clicked.connect(compress_audio)
-layout.addWidget(compress_button)
+button_row1.addWidget(compress_button)
 
-play_button = QPushButton("Écouter le fichier compressé")
+main_layout.addLayout(button_row1)
+
+# Second row of buttons
+button_row2 = QHBoxLayout()
+play_button = QPushButton("Écouter")
 play_button.clicked.connect(play_compressed_audio)
-layout.addWidget(play_button)
+button_row2.addWidget(play_button)
 
-size_diff_button = QPushButton("Différence de taille")
+size_diff_button = QPushButton("Différence taille")
 size_diff_button.clicked.connect(show_size_difference)
-layout.addWidget(size_diff_button)
+button_row2.addWidget(size_diff_button)
 
-compression_percentage_button = QPushButton("Pourcentage de compression")
+compression_percentage_button = QPushButton("% Compression")
 compression_percentage_button.clicked.connect(show_compression_percentage)
-layout.addWidget(compression_percentage_button)
+button_row2.addWidget(compression_percentage_button)
 
-window.setLayout(layout)
+main_layout.addLayout(button_row2)
+
+# Add stretch to push buttons up
+main_layout.addStretch(1)
+
 window.show()
 
 sys.exit(app.exec())
